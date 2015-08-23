@@ -1,10 +1,13 @@
 #ifdef NAMESPACE_EASYLOGGER
 
+#define _GNU_SOURCE
+
 #include <stdarg.h>
 #include <pthread.h>
-#include <string.h>
 #include <stdlib.h>
-#include <inttypes.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 typedef enum
 {
@@ -12,41 +15,28 @@ typedef enum
     elLogDbg_e,
     elLogInf_e,
     elLogWrn_e,
+    elLogErr_e,
     elLogFtl_e,
 }
 elSeverityLevel_t;
 
-typedef struct
-{
-    int line;
-    const char* file;
-    const char* function;
-    const char* format;
-    va_list arguments;
-} elLogMessage_t;
-
 typedef enum
 {
-    elFalse_e = 0,
-    elTrue_e = 1
+    elFalse_e,
+    elTrue_e,
 }
 elBool_t;
-
-#define EL_MESSAGE_BUFFER_LENGTH 1024
 
 typedef struct
 {
     elBool_t isInitialized;
-    elSeverityLevel_t currentSeverity;
-    pthread_mutex_t bufferLock;
-    uint16_t threadsWaitingForWrite;
-    elLogMessage_t* bufferTop;
-    elLogMessage_t* bufferLimit;
-    elLogMessage_t messageBuffer[EL_MESSAGE_BUFFER_LENGTH];
+    pthread_mutex_t streamLock;
+    elSeverityLevel_t level;
+    FILE* stream;
 }
 elLoggerData_t;
 
-static elLoggerData_t loggerData;
+static elLoggerData_t loggerData = { elFalse_e, PTHREAD_MUTEX_INITIALIZER, elLogInf_e, NULL };
 
 void elLoggerDestroy_f(void)
 {
@@ -54,84 +44,192 @@ void elLoggerDestroy_f(void)
     {
         return;
     }
+
+    loggerData.isInitialized = elFalse_e;
+
+    pthread_mutex_lock(&loggerData.streamLock);
+
+    if(loggerData.stream != NULL)
+    {
+        if(fflush(loggerData.stream) != 0)
+        {
+            perror("[FTL] error during flushing file stream during exit");
+        }
+
+        if(fclose(loggerData.stream) != 0)
+        {
+            perror("[FTL] error during closing log stream");
+        }
+    }
+
+    pthread_mutex_unlock(&loggerData.streamLock);
+
+    pthread_mutex_destroy(&loggerData.streamLock);
+
 }
 
-int elInitialize_f(void)
+int elLoggerInitialize_f(FILE* stream, elSeverityLevel_t level)
 {
-    memset(&loggerData, 0, sizeof(elLoggerData_t));
-
-    if(atexit(elLoggerDestroy_f))
+    if(stream == NULL)
     {
+        return EXIT_FAILURE;
     }
 
-    if(pthread_mutex_init(&loggerData.bufferLock, NULL))
+    loggerData.stream = stream;
+    loggerData.level = level;
+
+    if(pthread_mutex_init(&loggerData.streamLock, NULL) != 0)
     {
+        return EXIT_FAILURE;
     }
-
-    loggerData.bufferTop = loggerData.messageBuffer;
-    loggerData.bufferLimit = loggerData.messageBuffer + EL_MESSAGE_BUFFER_LENGTH;
-
 
     loggerData.isInitialized = elTrue_e;
-    return 0;
+
+    return EXIT_SUCCESS;
 }
 
-
-int elWriteLogMessage_f(elSeverityLevel_t severity,
+int elLoggerWriteMessage_f(elSeverityLevel_t severity,
                         int line,
                         const char* file,
                         const char* function,
                         const char* format,
                         ...)
 {
-    // lock all
-
     if(loggerData.isInitialized != elTrue_e)
     {
-        // unlock
-        return 1;
+        return EXIT_FAILURE;
     }
 
-    if(severity < loggerData.currentSeverity)
+    if(severity < loggerData.level)
     {
-        // unlock
-        return 2;
+        return EXIT_FAILURE;
     }
 
-    if (loggerData.bufferTop >= loggerData.bufferLimit)
+
+    int rc = EXIT_SUCCESS;
+    char timeString[20] =
     {
-        loggerData.threadsWaitingForWrite++;
-        // and wait for empty space in buffer
-    }
+        'Y', 'Y', 'Y', 'Y', '-', 'M', 'M', '-', 'D', 'D', '_',
+        'H', 'H', ':', 'M', 'M', ':', 'S', 'S', '\0'
+    };
+    time_t rawtime = time(NULL);
 
-    // some underflow
-    if (loggerData.bufferTop < loggerData.messageBuffer)
+    if(strftime (timeString, 20,"%Y-%m-%d_%H:%M:%S", localtime (&rawtime)) == 0)
     {
-        loggerData.bufferTop = loggerData.messageBuffer;
+        timeString[0] = 'Y';
+        timeString[1] = 'Y';
+        timeString[2] = 'Y';
+        timeString[3] = 'Y';
+        timeString[4] = '-';
+        timeString[5] = 'M';
+        timeString[6] = 'M';
+        timeString[7] = '-';
+        timeString[8] = 'D';
+        timeString[9] = 'D';
+        timeString[10] = '_';
+        timeString[11] = 'H';
+        timeString[12] = 'H';
+        timeString[13] = ':';
+        timeString[14] = 'M';
+        timeString[15] = 'M';
+        timeString[16] = ':';
+        timeString[17] = 'S';
+        timeString[18] = 'S';
+        timeString[19] = '\0';
     }
 
-    va_list currentArguments;
+    if(pthread_mutex_lock(&loggerData.streamLock) != 0)
+    {
+        return EXIT_FAILURE;
+    }
 
-    va_start(currentArguments, format);
-    va_copy(loggerData.bufferTop->arguments, currentArguments);
-    va_end(currentArguments);
+    switch(severity)
+    {
+        case elLogDev_e:
+            rc = fprintf(stderr, "[DEV][%s][", timeString);
+            break;
+        case elLogDbg_e:
+            rc = fprintf(stderr, "[DBG][%s][", timeString);
+            break;
+        case elLogInf_e:
+            rc = fprintf(stderr, "[INF][%s][", timeString);
+            break;
+        case elLogWrn_e:
+            rc = fprintf(stderr, "[WRN][%s][", timeString);
+            break;
+        case elLogErr_e:
+            rc = fprintf(stderr, "[ERR][%s][", timeString);
+            break;
+        case elLogFtl_e:
+            rc = fprintf(stderr, "[FTL][%s][", timeString);
+            break;
+    }
 
-    loggerData.bufferTop->line = line;
-    loggerData.bufferTop->file = file;
-    loggerData.bufferTop->function = function;
-    loggerData.bufferTop->format = format;
+    if(rc < 0)
+    {
+        perror("[FTL] error during writing log message header");
+        rc = EXIT_FAILURE;
+    }
 
-    loggerData.bufferTop++;
+    va_list arguments;
+    va_start(arguments, format);
+    if(vfprintf(stderr, format, arguments) < 0)
+    {
+        perror("[FTL] error during writing log message");
+        rc = EXIT_FAILURE;
+    }
+    va_end(arguments);
 
-    // unlock
+    if(fprintf(stderr, "][%u/%u/%ld][%s:%d:%s()]\n", getppid(), getpid(), syscall(SYS_gettid), file, line, function) < 0)
+    {
+        perror("[FTL] error during writing log message trace");
+        rc = EXIT_FAILURE;
+    }
 
-    return 0;
+    if(fflush(stderr) != 0)
+    {
+        perror("[FTL] error during flushing file stream");
+        rc = EXIT_FAILURE;
+    }
 
+    if(pthread_mutex_unlock(&loggerData.streamLock) != 0)
+    {
+        return EXIT_FAILURE;
+    }
+
+    return rc;
 }
+
+#define LOG_MSG_DEV( _MSG_ ) elLoggerWriteMessage_f(elLogDev_e, __LINE__, __FILE__, __func__, _MSG_)
+#define LOG_MSG_DBG( _MSG_ ) elLoggerWriteMessage_f(elLogDbg_e, __LINE__, __FILE__, __func__, _MSG_)
+#define LOG_MSG_INF( _MSG_ ) elLoggerWriteMessage_f(elLogInf_e, __LINE__, __FILE__, __func__, _MSG_)
+#define LOG_MSG_WRN( _MSG_ ) elLoggerWriteMessage_f(elLogWrn_e, __LINE__, __FILE__, __func__, _MSG_)
+#define LOG_MSG_ERR( _MSG_ ) elLoggerWriteMessage_f(elLogErr_e, __LINE__, __FILE__, __func__, _MSG_)
+#define LOG_MSG_FTL( _MSG_ ) elLoggerWriteMessage_f(elLogFtl_e, __LINE__, __FILE__, __func__, _MSG_)
+
+#define LOG_FMT_DEV( _MSG_ , ...) elLoggerWriteMessage_f(elLogDev_e, __LINE__, __FILE__, __func__, _MSG_, ## __VA_ARGS__)
+#define LOG_FMT_DBG( _MSG_ , ...) elLoggerWriteMessage_f(elLogDbg_e, __LINE__, __FILE__, __func__, _MSG_, ## __VA_ARGS__)
+#define LOG_FMT_INF( _MSG_ , ...) elLoggerWriteMessage_f(elLogInf_e, __LINE__, __FILE__, __func__, _MSG_, ## __VA_ARGS__)
+#define LOG_FMT_WRN( _MSG_ , ...) elLoggerWriteMessage_f(elLogWrn_e, __LINE__, __FILE__, __func__, _MSG_, ## __VA_ARGS__)
+#define LOG_FMT_ERR( _MSG_ , ...) elLoggerWriteMessage_f(elLogErr_e, __LINE__, __FILE__, __func__, _MSG_, ## __VA_ARGS__)
+#define LOG_FMT_FTL( _MSG_ , ...) elLoggerWriteMessage_f(elLogFtl_e, __LINE__, __FILE__, __func__, _MSG_, ## __VA_ARGS__)
 
 
 int main(void)
 {
+    elLoggerInitialize_f(stderr, elLogDev_e);
+    elLoggerWriteMessage_f(elLogDev_e, __LINE__, __FILE__, __func__, "Hello %d. %s", 1, "World!");
+    elLoggerWriteMessage_f(elLogDbg_e, __LINE__, __FILE__, __func__, "Hello %d. %s", 1, "World!");
+    elLoggerWriteMessage_f(elLogInf_e, __LINE__, __FILE__, __func__, "Hello %d. %s", 1, "World!");
+    elLoggerWriteMessage_f(elLogWrn_e, __LINE__, __FILE__, __func__, "Hello %d. %s", 1, "World!");
+    elLoggerWriteMessage_f(elLogErr_e, __LINE__, __FILE__, __func__, "Hello %d. %s", 1, "World!");
+    elLoggerWriteMessage_f(elLogFtl_e, __LINE__, __FILE__, __func__, "Hello %d. %s", 1, "World!");
+    elLoggerWriteMessage_f(elLogFtl_e, __LINE__, NULL, NULL, "Hello %d. %s", 1, "World!");
+
+    LOG_MSG_FTL("hello World");
+
+    elLoggerDestroy_f();
+
     return 0;
 }
 
