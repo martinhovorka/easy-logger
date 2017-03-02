@@ -1,6 +1,6 @@
 /*
  *   EasyLogger - Simple thread-safe logging library
- *   Copyright (C) 2016, 2017  Martim Hovorka
+ *   Copyright (C) 2016, 2017  Martin Hovorka
  *
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
